@@ -57,14 +57,15 @@ fn MatchCursor(comptime patterns: []const [:0]const u8) type {
         cur: usize = 0,
 
         fn check(self: *Self, text: []const u8) void {
-            inline for (lengths) |l| {
+            inline for (1..lengths.len + 1) |offset| {
+                const l = lengths[lengths.len - offset];
                 const stop: usize = @min(l.len, text.len);
                 const start: usize = @min(self.cur, stop);
                 for (text[start..stop]) |c| {
                     self.char_confirmed &= table[c];
                     self.cur += 1;
                 }
-                if (self.cur < stop) {
+                if (self.cur < l.len) {
                     @branchHint(.unlikely);
                     return;
                 }
@@ -136,25 +137,6 @@ const SkipTable = struct {
     }
 };
 
-// pub fn findInPos(haystack: []const u8, pos: usize) struct { usize, ?Pattern } {
-//     var _pos: usize = pos;
-//     var match_len: usize = 0;
-//     while (_pos < haystack.len - min_len and _pos + match_len != haystack.len) : ({
-//         _pos += skip_table[haystack[_pos + min_len - 1]];
-//     }) {
-//         if (!first_char[haystack[_pos]]) continue;
-//         match_len, const idx = same(haystack[_pos..]);
-//         if (patterns[idx].len == match_len)
-//             return .{ _pos, @enumFromInt(idx) };
-//     }
-//     while (_pos < haystack.len and match_len != haystack.len) : (_pos += 1) {
-//         if (!first_char[haystack[_pos]]) continue;
-//         match_len, _ = same(haystack[_pos..]);
-//     }
-//     while (_pos < haystack.len and !first_char[haystack[_pos]]) _pos += 1;
-//     return .{ _pos, null };
-// }
-
 const StreamCursor = struct {
     reader: *std.Io.Reader,
     writer: *std.Io.Writer,
@@ -177,14 +159,30 @@ const StreamCursor = struct {
         self.data = self.data[n..];
     }
 
-    fn peekDelimiterExclusive(self: *@This(), delimiter: u8) !void {
-        self.data = self.reader.peekDelimiterExclusive(delimiter) catch |err| switch (err) {
-            error.StreamTooLong => {
-                self.data = self.reader.buffered();
-                return err;
-            },
-            else => return err,
-        };
+    const ReaderState = enum{
+        BufferFull,
+        DelimiterReached,
+
+    };
+
+    const LoadError = error{
+        /// More bytes could not be loaded because the buffer is full
+        BufferFull,
+        /// See the `Reader` implementation for detailed diagnostics.
+        ReadFailed,
+        EndOfStream,
+    };
+
+    fn loadToDelimiter(self: *@This(), delimiter: u8) LoadError!bool {
+        const prev_len = self.data.len;
+        if (self.reader.bufferedLen() == prev_len)
+            try self.reader.fillMore();
+        if (self.reader.bufferedLen() == prev_len)
+            return error.BufferFull;
+
+        const pos = std.mem.indexOfScalarPos(u8, self.reader.buffered(), prev_len, delimiter);
+        self.data = if (pos) |p| self.reader.buffered()[0..p] else self.reader.buffered();
+        return pos != null;
     }
 
     fn streamReplaceDelimiter(self: *@This(), delimiter: u8) !usize {
@@ -193,35 +191,31 @@ const StreamCursor = struct {
         };
         const skip_table = SkipTable.init(patterns);
         var matcher = MatchCursor(patterns){};
-        var loop = true;
-        outer: while (loop) {
-            loop = false;
-            self.peekDelimiterExclusive(delimiter) catch |err| switch (err) {
-                // Make another loop when we have processed the buffer
-                error.StreamTooLong => loop = true,
-                else => return err,
-            };
-
-            inner: while (self.data.len > 0) : ({
-                const skip = @min(self.data.len, skip_table.skip(self.data));
-                try self.stream(skip);
-                matcher = .{};
-            }) {
-                const pat, const pat_string = switch (matcher.longest(self.data)) {
-                    .no_match => continue :inner,
+        var delimiter_found = false;
+        outer: while (!delimiter_found) {
+            delimiter_found = try self.loadToDelimiter(delimiter);
+            while (self.data.len >= skip_table.min_len) {
+                switch (matcher.longest(self.data)) {
+                    .no_match => {
+                        const skip = skip_table.skip(self.data);
+                        try self.stream(skip);
+                        matcher = .{};
+                    },
                     .possible_matches => {
                         @branchHint(.unlikely);
                         continue :outer;
                     },
-                    .match => |pat| .{pat, @tagName(pat)},
-                };
-                try self.replace(pat_string.len, switch (pat) {
-                    .@"&amp;" => "&",
-                    .@"&gt;" => ">",
-                    .@"&lt;" => "<",
-                    .@"&quote;" => "\"",
-                    .@"&apos;" => "'",
-                });
+                    .match => |pat| {
+                        try self.replace(@tagName(pat).len, switch (pat) {
+                            .@"&amp;" => "&",
+                            .@"&gt;" => ">",
+                            .@"&lt;" => "<",
+                            .@"&quote;" => "\"",
+                            .@"&apos;" => "'",
+                        });
+                        matcher = .{};
+                    }
+                }
             }
         }
         if (self.data.len > 0)
@@ -243,7 +237,7 @@ test "streaming replacement" {
     const test_text =
         \\<request name="sync">
         \\  &lt;description summary=&quote;asynchronous roundtrip&quote;&gt;
-        \\    The sync request asks the server to emit the 'done' event...
+        \\    The sync request asks the server to emit the &apos;done&apos; event...
         \\
         \\    The callback_data passed in the callback is undefined and should be
         \\    ignored.
@@ -280,5 +274,6 @@ test "streaming replacement" {
     _ = try reader.streamRemaining(writer);
 
     const actual = try allocating_writer.toOwnedSliceSentinel(0);
+    defer gpa.free(actual);
     try std.testing.expectEqualStrings(expected, actual);
 }
