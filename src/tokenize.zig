@@ -7,42 +7,41 @@ const root = @import("root.zig");
 fn MatchCursor(comptime patterns: []const [:0]const u8) type {
     const P = @TypeOf(patterns[0]);
     const Flags = @Type(.{ .int = .{ .bits = patterns.len, .signedness = .unsigned } });
-    const by_length = (comptime init: {
-        var res = root.copy(P, patterns);
-        _ = root.sortDesc(.{ .field = "len" }, P, &res);
-        break :init res;
-    });
+    comptime var init_by_lengths = root.copy(P, patterns);
+    _ = root.sortDesc(.{ .field = "len" }, P, &init_by_lengths);
+    // const by_length = init_by_lengths;
 
-    const lengths = (comptime init: {
-        var data = root.select(.{ .field = "len" }, usize, by_length.len, by_length);
-        const deduped = root.dedupOn(.value, usize, &data);
-        _ = root.sortDesc(.value, usize, deduped);
-        var result: [deduped.len]struct { len: usize, flags: Flags } = undefined;
-        var r_idx: usize = 0;
-        result[r_idx] = .{.len = by_length[0].len, .flags = 1};
-        for (by_length[1..], 1..) |pat, p_idx| {
-            if (pat.len != result[r_idx].len) {
+    comptime var init_lengths: [root.uniques(.{ .field = "len" }, &init_by_lengths)]struct {
+        len: usize,
+        flags: Flags,
+    } = undefined;
+    {
+        comptime var r_idx: usize = 0;
+        init_lengths[r_idx] = .{ .len = init_by_lengths[0].len, .flags = 1 };
+        for (init_by_lengths[1..], 1..) |pat, p_idx| {
+            if (pat.len != init_lengths[r_idx].len) {
                 r_idx += 1;
-                result[r_idx] = .{.len = pat.len, .flags = 1 << p_idx};
-            } else
-                result[r_idx].flags |= 1 << p_idx;
+                init_lengths[r_idx] = .{ .len = pat.len, .flags = 1 << p_idx };
+            } else init_lengths[r_idx].flags |= 1 << p_idx;
         }
-        break :init result;
-    });
+    }
+    // const lengths = init_lengths;
 
     comptime var init_table = [_]Flags{0} ** (std.math.maxInt(u8) + 1);
-    for (by_length, 0..) |pat, p_idx| for (pat) |c| {
+    for (init_by_lengths, 0..) |pat, p_idx| for (pat) |c| {
         init_table[c] |= 1 << p_idx;
     };
     const table = init_table;
 
-    comptime var init_enum_fields: [by_length.len]std.builtin.Type.EnumField = undefined;
-    for (&init_enum_fields, by_length, 0..) |*ef, p, i|
+    comptime var init_enum_fields: [init_by_lengths.len]std.builtin.Type.EnumField = undefined;
+    for (&init_enum_fields, init_by_lengths, 0..) |*ef, p, i|
         ef.* = .{ .name = p, .value = i };
     const enum_fields = init_enum_fields;
 
     return struct {
         const Self = @This();
+        const by_length = init_by_lengths;
+        const lengths = init_lengths;
         pub const Pattern = @Type(.{
             .@"enum" = .{
                 .fields = &enum_fields,
@@ -92,7 +91,7 @@ fn MatchCursor(comptime patterns: []const [:0]const u8) type {
                 if (std.mem.eql(u8, p_string, text[0..p_string.len]))
                     return .possible_matches;
                 self.char_confirmed &= switch (p_idx) {
-                    inline 0 ... by_length.len - 1 => |idx| ~(@as(Flags, 1) << idx),
+                    inline 0...by_length.len - 1 => |idx| ~(@as(Flags, 1) << idx),
                     else => unreachable,
                 };
             }
@@ -104,7 +103,7 @@ fn MatchCursor(comptime patterns: []const [:0]const u8) type {
                 if (std.mem.eql(u8, p_string, text[0..p_string.len]))
                     return .{ .match = @enumFromInt(p_idx) };
                 self.len_confirmed &= switch (p_idx) {
-                    inline 0 ... by_length.len - 1 => |idx| ~(@as(Flags, 1) << idx),
+                    inline 0...by_length.len - 1 => |idx| ~(@as(Flags, 1) << idx),
                     else => unreachable,
                 };
             }
@@ -159,10 +158,9 @@ const StreamCursor = struct {
         self.data = self.data[n..];
     }
 
-    const ReaderState = enum{
+    const ReaderState = enum {
         BufferFull,
         DelimiterReached,
-
     };
 
     const LoadError = error{
@@ -186,9 +184,7 @@ const StreamCursor = struct {
     }
 
     fn streamReplaceDelimiter(self: *@This(), delimiter: u8) !usize {
-        const patterns: []const [:0]const u8 = &.{
-            "&amp;", "&gt;", "&lt;", "&quote;", "&apos;"
-        };
+        const patterns: []const [:0]const u8 = &.{ "&amp;", "&gt;", "&lt;", "&quote;", "&apos;" };
         const skip_table = SkipTable.init(patterns);
         var matcher = MatchCursor(patterns){};
         var delimiter_found = false;
@@ -214,7 +210,7 @@ const StreamCursor = struct {
                             .@"&apos;" => "'",
                         });
                         matcher = .{};
-                    }
+                    },
                 }
             }
         }

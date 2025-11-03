@@ -61,6 +61,14 @@ pub fn dedupOn(comptime mapper: Mapper, T: type, items: []T) []T {
     return result;
 }
 
+/// Counts unique elements in a sorted array
+pub fn uniques(comptime mapper: Mapper, sorted: anytype) usize {
+    var count: usize = @min(1, sorted.len);
+    for (count..sorted.len) |idx|
+        count += @intFromBool(mapper.cmp(.neq, sorted[idx - 1], sorted[idx]));
+    return count;
+}
+
 pub fn copy(comptime T: type, comptime items: []const T) [items.len]T {
     var result: [items.len]T = undefined;
     @memcpy(&result, items);
