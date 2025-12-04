@@ -53,12 +53,11 @@ fn PatternPrefix(comptime N: usize) type {
             const eq_last = self.last_letter == last_block;
             var maybe_pos = PosMask { .mask = @bitCast(eq_first & eq_last) };
             var confirmed_pos = PosMask { .mask = 0 };
-            while (maybe_pos.findFirstSet()) |bitpos| {
+            while (maybe_pos.findFirstSet()) |bitpos| : (maybe_pos.unset(bitpos)) {
                 const candidate = haystack[bitpos + 1 ..][0 .. self.inner.len];
                 if (eql(u8, self.inner, candidate)) {
                     confirmed_pos.set(bitpos);
                 }
-                maybe_pos.unset(bitpos);
             }
             return confirmed_pos;
         }
@@ -169,8 +168,7 @@ fn findFirst(comptime needles: []const [:0]const u8, haystack: []const u8) ?stru
             const prefix_pats = patterns[pat_index..][0..prefix.pat_count];
             pat_index += prefix.pat_count;
             var prefix_matches = prefix.match(remaining[0.. VECTOR_SIZE + N]);
-            while (prefix_matches.findFirstSet()) |bitpos| {
-                prefix_matches.unset(bitpos);
+            while (prefix_matches.findFirstSet()) |bitpos| : (prefix_matches.unset(bitpos)) {
                 const suffix = remaining[bitpos + N..];
                 for (prefix_pats) |pat| {
                     const pat_suffix = pat.content[N..];
