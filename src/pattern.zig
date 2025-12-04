@@ -1,6 +1,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const eql = std.mem.eql;
+const Allocator = std.mem.Allocator;
 
 const VECTOR_SIZE = 32;
 const Block = @Vector(VECTOR_SIZE, u8);
@@ -9,7 +10,7 @@ const PosMask = std.bit_set.IntegerBitSet(32);
 const Pattern = struct {
     const Self = @This();
     index: usize,
-    content: [:0]const u8,
+    content: []const u8,
 
     fn collection(comptime C: usize, items: *const [C][:0]const u8) [C]Self {
         var result: [C]Self = undefined;
@@ -27,7 +28,7 @@ const Pattern = struct {
         return result;
     }
 
-    pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    pub fn format(self: Self, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         return writer.print("{s} {{ index: {d}, content: '{s}' }}", .{
             @typeName(Self),
             self.index,
@@ -36,6 +37,176 @@ const Pattern = struct {
     }
 
 };
+
+fn init_patterns(patterns: []Pattern, pat_strings: []const []const u8) struct {
+    prefix_len: usize,
+    unique_first_letters: usize,
+    unique_prefixes: usize,
+} {
+    assert(patterns.len != 0 and pat_strings.len != 0);
+    assert(patterns.len == pat_strings.len);
+
+    var prefix_len = std.math.maxInt(usize);
+    for (patterns, pat_strings, 0..) |*dst, src, i| {
+        prefix_len = @min(prefix_len, src.len);
+        dst.* = .{ .index = i, .content = src };
+    }
+    std.mem.sort(Pattern, patterns, {}, struct {
+        pub fn lessThan(_: void, lhs: Pattern, rhs: Pattern) bool {
+            const len = @min(lhs.content.len, rhs.content.len);
+            return for (lhs.content[0..len], rhs.content[0..len]) |l, r| {
+                if (l != r) break l < r;
+            } else lhs.content.len < rhs.content.len;
+        }
+    }.lessThan);
+
+    var unique_first_letters: usize = 1;
+    var unique_prefixes: usize = 1;
+    var previous = patterns[0].content[0..prefix_len];
+    for (patterns[1..]) |pattern| {
+        const current = pattern.content[0..prefix_len];
+        unique_first_letters += @intFromBool(previous[0] != current[0]);
+        unique_prefixes += @intFromBool(!eql(u8, previous, current));
+        previous = current;
+    }
+    return .{
+        .prefix_len = prefix_len,
+        .unique_first_letters = unique_first_letters,
+        .unique_prefixes = unique_prefixes,
+    };
+}
+
+const FirstLetter = struct { letter: u8, count: usize };
+const Prefix = struct { content: []const u8, count: usize };
+
+fn init_prefix_stats(
+    _first_letters: []FirstLetter,
+    _prefixes: []Prefix,
+    _prefix_len: usize,
+    initialized_patterns: []const Pattern,
+) void {
+    assert(initialized_patterns.len >= _prefixes.len);
+    assert(_prefixes.len >= _first_letters.len);
+
+    var previous = initialized_patterns[0].content[0.._prefix_len];
+    var first_letter_idx = 0;
+    var prefix_idx = 0;
+    _first_letters[first_letter_idx] = .{ .letter = previous[0], .count = 1 };
+    _prefixes[prefix_idx] = .{ .content = previous, .count = 1 };
+
+    for (initialized_patterns[1..]) |pattern| {
+        const current = pattern.content[0.._prefix_len];
+        if (previous[0] != current[0]) {
+            first_letter_idx += 1;
+            _first_letters[first_letter_idx] = .{ .letter = current[0], .count = 0 };
+        }
+        if (!eql(u8, previous, current)) {
+            prefix_idx += 1;
+            _prefixes[prefix_idx] = .{ .content = current, .count = 0 };
+        }
+        _first_letters[first_letter_idx].count += 1;
+        _prefixes[prefix_idx].count += 1;
+        previous = current;
+    }
+}
+
+const Collection = struct {
+    const Self = @This();
+
+    prefix_len: usize,
+    first_letters: []const FirstLetter,
+    prefixes: []const Prefix,
+    patterns: []const Pattern,
+
+
+    /// Creates a new pattern collection from a slice of strings using.
+    ///
+    /// **OBS:** The created collection needs to be deinitialized with
+    /// `deinit` using the same allocator in order to not leak memory.
+    pub fn allocate(allocator: Allocator, pattern_strings: []const []const u8) error{OutOfMemory}!Self {
+        const _patterns = try allocator.alloc(Pattern, pattern_strings.len);
+        errdefer allocator.free(_patterns);
+        const stats = init_patterns(_patterns, pattern_strings);
+
+        const _first_letters = try allocator.alloc(FirstLetter, stats.unique_first_letters);
+        errdefer allocator.free(_first_letters);
+        const _prefixes = try allocator.alloc(Prefix, stats.unique_prefixes);
+        errdefer allocator.free(_prefixes);
+        init_prefix_stats(_first_letters, _prefixes, stats.prefix_len, _patterns);
+        return Self {
+            .prefix_len = stats.prefix_len,
+            .first_letters = _first_letters,
+            .prefixes = _prefixes,
+            .patterns = _patterns,
+        };
+    }
+
+    /// Deinitialize this collection, `allocator` should be the same as was
+    /// used to create it.
+    pub fn deinit(self: *Self, allocator: Allocator) void {
+        allocator.free(self.prefixes);
+        allocator.free(self.first_letters);
+        allocator.free(self.patterns);
+        self.* = undefined;
+    }
+
+};
+
+fn pattern_collection(comptime pattern_strings: []const []const u8) Collection {
+    const n: usize = pattern_strings.len;
+    comptime var _patterns: [n]Pattern = undefined;
+    const stats = comptime init_patterns(&_patterns, pattern_strings);
+    const patterns = _patterns;
+    comptime var _first_letters: [stats.unique_first_letters]FirstLetter = undefined;
+    comptime var _prefixes: [stats.unique_prefixes]Prefix = undefined;
+    comptime init_prefix_stats(&_first_letters, &_prefixes, stats.prefix_len, &patterns);
+    const first_letters = _first_letters;
+    const prefixes = _prefixes;
+    return .{
+        .prefix_len = stats.prefix_len,
+        .first_letters = &first_letters,
+        .prefixes = &prefixes,
+        .patterns = &patterns,
+    };
+}
+
+test "does comptime works like this" {
+    std.debug.print("\n", .{});
+    const patterns = pattern_collection(&.{
+        "hejsan", "svejsan", "på dejsan"
+    });
+
+    const patterns2 = pattern_collection(&.{
+        "generical",
+        "eric insta",
+        "generic instance",
+        "av",
+        "hghhgh",
+    });
+
+    try std.testing.expectEqual(2, patterns2.prefix_len);
+    try std.testing.expectEqual(6, patterns.prefix_len);
+
+    std.debug.print("patterns2 prefixes:\n", .{});
+    var expect: []const []const u8 = &.{
+        "av", "er", "ge", "hg",
+    };
+    for (expect, patterns2.prefixes) |expected, prefix| {
+        std.debug.print("\"{s}\",\n", .{prefix.content});
+        try std.testing.expectEqualStrings(expected, prefix.content);
+    }
+
+    std.debug.print("patterns prefixes:\n", .{});
+    expect = &.{
+        "hejsan", "på de", "svejsa",
+    };
+    for (expect, patterns.prefixes) |expected, prefix| {
+        std.debug.print("\"{s}\",\n", .{prefix.content});
+        try std.testing.expectEqualStrings(expected, prefix.content);
+    }
+
+}
+
 
 fn PatternPrefix(comptime N: usize) type {
     return struct {
@@ -134,9 +305,9 @@ fn findFirst(comptime needles: []const [:0]const u8, haystack: []const u8) ?stru
     const C = needles.len;
     const _needles = needles[0..C];
     const N = comptime min_len([:0]const u8, _needles);
-    const Prefix = PatternPrefix(N);
+    const PPrefix = PatternPrefix(N);
     const patterns = Pattern.collection(C, _needles);
-    const prefixes = Prefix.create_buffer(C, &patterns);
+    const prefixes = PPrefix.create_buffer(C, &patterns);
 
     std.debug.print("Patterns:\n", .{});
     for (patterns) |pattern| {
